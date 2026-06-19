@@ -87,7 +87,10 @@ export interface DeveloperScoreBreakdown {
   lowReReview: number | null; // 0~100, 리뷰 스레드 데이터 없으면 null (재논의가 적을수록 높음)
   pipelineFirstTry: number | null; // 0~100, 파이프라인 데이터 없으면 null
   lowCommentDensity: number | null; // 0~100, 변경 라인 데이터 없으면 null
+  lowUnresolvedComments: number | null; // 0~100, 변경 라인 데이터 없으면 null
   lowRevertRatio: number; // 0~100, 높을수록 좋음
+  lowOversizedMRRatio: number; // 0~100, 대형 MR 비율이 낮을수록 높음
+  testChangeCoverage: number | null; // 0~100, 변경 라인 데이터 없으면 null
 }
 
 export type ConfidenceLevel = 'low' | 'medium' | 'high';
@@ -102,6 +105,9 @@ export interface DeveloperMetrics {
 
   totalLinesChanged: number;
   avgLinesChangedPerMR: number;
+  effectiveWorkloadLinesChanged: number; // 작업량 점수에 실제 반영한 변경 라인 수
+  initLikeMRs: number; // 초기 구축/스캐폴딩 성격으로 라인 기여도를 낮춘 MR 수
+  initLikeLinesChanged: number; // 초기 구축/스캐폴딩 성격 MR의 원본 변경 라인 수
 
   totalReviewComments: number;
   avgReviewCommentsPerMR: number; // 본인 제외, 타인이 남긴 코멘트 평균
@@ -120,6 +126,7 @@ export interface DeveloperMetrics {
 
   pipelineEvaluatedMRs: number; // 파이프라인 데이터가 있어 first try 평가가 가능한 MR 수
   pipelineMissingMRs: number;
+  pipelineCoverageRate: number; // pipelineEvaluatedMRs / totalMRs
   pipelineFirstTrySuccessRate: number; // 첫 파이프라인이 success였던 비율
 
   totalCommits: number;
@@ -129,12 +136,18 @@ export interface DeveloperMetrics {
   oversizedMRs: number; // 변경 라인 수가 기준을 넘는 MR 수
   oversizedMRRatio: number;
 
+  totalTestLinesChanged: number;
+  testChangeRatio: number; // 테스트 변경 라인 / 전체 변경 라인
+
   avgHoursToMerge: number | null;
 
   scoreBreakdown: DeveloperScoreBreakdown;
   scoreCoverageRate: number; // 실제 점수 산정에 사용된 가중치 비율. 1에 가까울수록 데이터가 충분함
   confidenceScore: number; // 표본 수와 데이터 커버리지를 반영한 신뢰도 점수
   confidenceLevel: ConfidenceLevel;
+  workloadScore: number; // 같은 리포트 내 작업량 상대 점수(MR 수 + 변경 라인)
+  platformReadinessScore: number; // 품질 점수와 작업량 점수를 함께 본 선별용 점수
+  dataWarnings: string[];
 
   qualityScore: number; // 0~100, metrics.ts의 가중치 기반 산출
 }

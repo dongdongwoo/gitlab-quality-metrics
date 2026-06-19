@@ -168,22 +168,34 @@ export function hoursBetween(a: string, b: string): number {
 // push 횟수는 코멘트를 나눠 처리하는 스타일까지 감점해 왜곡되기 때문에,
 // "리뷰어가 같은 스레드에 다시 와서 아직 부족하다고 한" 비율(reReviewedThreadRatio)을 사용합니다.
 export const QUALITY_WEIGHTS = {
-  lowReReview: 0.35,
-  pipelineFirstTry: 0.3,
-  lowCommentDensity: 0.2,
-  lowRevertRatio: 0.15,
+  lowReReview: 0.25,
+  lowCommentDensity: 0.15,
+  lowUnresolvedComments: 0.25,
+  lowRevertRatio: 0.1,
+  lowOversizedMRRatio: 0.2,
+  testChangeCoverage: 0.05,
 } as const;
 
 const TOTAL_WEIGHT = Object.values(QUALITY_WEIGHTS).reduce((s, w) => s + w, 0);
 
 const SCORE_SCALE = {
-  // 리뷰 스레드의 30%가 재논의되면 50점 수준. 팀 문화에 따라 0.2~0.5 사이 조정 권장.
-  reReviewedThreadRatio: 0.3,
-  // 100줄당 리뷰어 코멘트 1개까지는 건강한 리뷰 활동으로 보고 감점하지 않음.
-  commentDensityFreeAllowance: 1,
-  // free allowance 초과분이 5개/100줄이면 큰 폭으로 감점.
-  commentDensity: 5,
+  // 리뷰 스레드의 15%가 재논의되면 50점 수준. Platform 후보 선별용으로 엄격하게 봅니다.
+  reReviewedThreadRatio: 0.15,
+  // 100줄당 리뷰어 코멘트 0.5개까지는 건강한 리뷰 활동으로 보고 감점하지 않음.
+  commentDensityFreeAllowance: 0.5,
+  // free allowance 초과분이 2.5개/100줄이면 큰 폭으로 감점.
+  commentDensity: 2.5,
+  // 100줄당 미해결 코멘트 0.25개면 50점 수준.
+  unresolvedCommentDensity: 0.25,
   oversizedMRLines: 800,
+  // 전체 변경 라인 중 테스트 변경이 20% 이상이면 테스트 커버리지 점수 만점.
+  testChangeRatioTarget: 0.2,
+  // 대형 MR 비율이 10%면 50점 수준.
+  oversizedMRRatio: 0.1,
+  // 작업량 점수에서는 MR 1개가 라인 수를 과도하게 독식하지 않도록 cap을 둡니다.
+  workloadMRLineCap: 800,
+  // 초기 구축/스캐폴딩 성격 MR은 라인 수 기여도를 낮춥니다.
+  initLikeWorkloadLineMultiplier: 0.25,
 };
 
 function clamp01(value: number): number {
@@ -203,6 +215,103 @@ function round1(value: number): number {
 
 function scoreTo100(score: number): number {
   return round1(clamp01(score) * 100);
+}
+
+function normalizeCohortVolume(value: number, cohortMax: number): number {
+  if (cohortMax <= 0) return 0;
+  // 작업량은 최댓값 대비 상대 점수로 보되, sqrt로 상위 1명만 과도하게 독식하지 않게 합니다.
+  return Math.sqrt(clamp01(value / cohortMax));
+}
+
+function calculateWorkloadScore(
+  totalMRs: number,
+  effectiveWorkloadLinesChanged: number,
+  maxMRs: number,
+  maxEffectiveWorkloadLinesChanged: number,
+): number {
+  const mrVolumeScore = normalizeCohortVolume(totalMRs, maxMRs);
+  const lineVolumeScore = normalizeCohortVolume(
+    effectiveWorkloadLinesChanged,
+    maxEffectiveWorkloadLinesChanged,
+  );
+  return round1(100 * (0.55 * mrVolumeScore + 0.45 * lineVolumeScore));
+}
+
+function calculatePlatformReadinessScore(qualityScore: number, workloadScore: number): number {
+  // Platform 후보는 품질이 먼저지만, 같은 품질이면 실제 작업량이 충분한 사람이 더 강한 신호입니다.
+  return round1(0.65 * qualityScore + 0.35 * workloadScore);
+}
+
+const TEST_FILE_PATTERN =
+  /(^|\/)(__tests__|tests?|specs?)(\/|$)|(^|\/)[^/]+\.(test|spec)\.[jt]sx?$|(^|\/)(jest|vitest|playwright|cypress)\.config\.[jt]s$/i;
+
+function isTestFile(path: string): boolean {
+  return TEST_FILE_PATTERN.test(path);
+}
+
+function countTestLinesChanged(mrs: EnrichedMR[]): number {
+  return mrs.reduce((sum, mr) => {
+    const mrTestLines = mr.changes.reduce((fileSum, file) => {
+      const path = file.new_path || file.old_path;
+      if (!isTestFile(path)) return fileSum;
+      const { additions, deletions } = countDiffLines(file.diff ?? '');
+      return fileSum + additions + deletions;
+    }, 0);
+    return sum + mrTestLines;
+  }, 0);
+}
+
+const INIT_LIKE_PATTERN =
+  /\b(init|initial|bootstrap|boilerplate|scaffold|setup|starter|template|skeleton|프로젝트\s*초기|초기\s*구축|기본\s*구성)\b/i;
+
+function countNewFileLinesChanged(mr: EnrichedMR): number {
+  return mr.changes.reduce((sum, file) => {
+    if (!file.new_file) return sum;
+    const { additions, deletions } = countDiffLines(file.diff ?? '');
+    return sum + additions + deletions;
+  }, 0);
+}
+
+function isInitLikeMR(mr: EnrichedMR): boolean {
+  const linesChanged = mr.additions + mr.deletions;
+  if (linesChanged === 0) return false;
+
+  const text = [
+    mr.mr.title,
+    mr.mr.source_branch,
+    ...mr.commits.flatMap((commit) => [commit.title, commit.message]),
+  ].join('\n');
+  const newFileLineRatio = countNewFileLinesChanged(mr) / linesChanged;
+
+  if (INIT_LIKE_PATTERN.test(text)) {
+    return linesChanged >= SCORE_SCALE.oversizedMRLines || newFileLineRatio >= 0.5;
+  }
+
+  // 제목에 init 힌트가 없어도, 대량 신규 파일 추가는 초기 구축/스캐폴딩일 가능성이 높습니다.
+  return linesChanged >= SCORE_SCALE.oversizedMRLines * 2 && newFileLineRatio >= 0.8;
+}
+
+function calculateWorkloadLineStats(mrs: EnrichedMR[]): {
+  effectiveWorkloadLinesChanged: number;
+  initLikeMRs: number;
+  initLikeLinesChanged: number;
+} {
+  return mrs.reduce(
+    (acc, mr) => {
+      const linesChanged = mr.additions + mr.deletions;
+      const cappedLines = Math.min(linesChanged, SCORE_SCALE.workloadMRLineCap);
+      if (isInitLikeMR(mr)) {
+        acc.initLikeMRs++;
+        acc.initLikeLinesChanged += linesChanged;
+        acc.effectiveWorkloadLinesChanged +=
+          cappedLines * SCORE_SCALE.initLikeWorkloadLineMultiplier;
+      } else {
+        acc.effectiveWorkloadLinesChanged += cappedLines;
+      }
+      return acc;
+    },
+    { effectiveWorkloadLinesChanged: 0, initLikeMRs: 0, initLikeLinesChanged: 0 },
+  );
 }
 
 function calculateConfidence(
@@ -227,6 +336,15 @@ export function aggregateDeveloperMetrics(
   mrsByAuthor: Map<string, EnrichedMR[]>,
 ): DeveloperMetrics[] {
   const result: DeveloperMetrics[] = [];
+  const authorStats = [...mrsByAuthor.values()].map((mrs) => ({
+    totalMRs: mrs.length,
+    effectiveWorkloadLinesChanged: calculateWorkloadLineStats(mrs).effectiveWorkloadLinesChanged,
+  }));
+  const maxMRs = Math.max(0, ...authorStats.map((s) => s.totalMRs));
+  const maxEffectiveWorkloadLinesChanged = Math.max(
+    0,
+    ...authorStats.map((s) => s.effectiveWorkloadLinesChanged),
+  );
 
   for (const [username, mrs] of mrsByAuthor.entries()) {
     const totalMRs = mrs.length;
@@ -235,6 +353,10 @@ export function aggregateDeveloperMetrics(
 
     const totalLinesChanged = mrs.reduce((s, m) => s + m.additions + m.deletions, 0);
     const avgLinesChangedPerMR = totalMRs ? totalLinesChanged / totalMRs : 0;
+    const { effectiveWorkloadLinesChanged, initLikeMRs, initLikeLinesChanged } =
+      calculateWorkloadLineStats(mrs);
+    const totalTestLinesChanged = countTestLinesChanged(mrs);
+    const testChangeRatio = totalLinesChanged > 0 ? totalTestLinesChanged / totalLinesChanged : 0;
 
     const oversizedMRs = mrs.filter(
       (m) => m.additions + m.deletions >= SCORE_SCALE.oversizedMRLines,
@@ -289,6 +411,7 @@ export function aggregateDeveloperMetrics(
       : 0;
     const pipelineEvaluatedMRs = mrsWithPipeline.length;
     const pipelineMissingMRs = totalMRs - pipelineEvaluatedMRs;
+    const pipelineCoverageRate = totalMRs ? pipelineEvaluatedMRs / totalMRs : 0;
 
     const totalCommits = mrs.reduce((s, m) => s + m.commits.length, 0);
     const revertCommits = mrs.reduce(
@@ -308,6 +431,10 @@ export function aggregateDeveloperMetrics(
     const mergeRate = totalMRs ? mergedMRs / totalMRs : 0;
 
     const lowRevertRatioScore = 1 - clamp01(revertCommitRatio);
+    const lowOversizedMRRatioScore = normalizeInverse(
+      oversizedMRRatio,
+      SCORE_SCALE.oversizedMRRatio,
+    );
 
     const components: Array<{
       key: keyof DeveloperScoreBreakdown;
@@ -315,6 +442,11 @@ export function aggregateDeveloperMetrics(
       score: number;
     }> = [
       { key: 'lowRevertRatio', weight: QUALITY_WEIGHTS.lowRevertRatio, score: lowRevertRatioScore },
+      {
+        key: 'lowOversizedMRRatio',
+        weight: QUALITY_WEIGHTS.lowOversizedMRRatio,
+        score: lowOversizedMRRatioScore,
+      },
     ];
 
     // 재작업 신호: 리뷰 스레드가 있어야 평가 가능. 없으면 (아무도 리뷰 안 함) 점수에서 제외.
@@ -328,17 +460,11 @@ export function aggregateDeveloperMetrics(
       });
     }
 
-    let pipelineFirstTryScore: number | null = null;
-    if (mrsWithPipeline.length > 0) {
-      pipelineFirstTryScore = pipelineFirstTrySuccessRate;
-      components.push({
-        key: 'pipelineFirstTry',
-        weight: QUALITY_WEIGHTS.pipelineFirstTry,
-        score: pipelineFirstTryScore,
-      });
-    }
+    const pipelineFirstTryScore = mrsWithPipeline.length > 0 ? pipelineFirstTrySuccessRate : null;
 
     let lowCommentDensityScore: number | null = null;
+    let lowUnresolvedCommentsScore: number | null = null;
+    let testChangeCoverageScore: number | null = null;
     if (totalLinesChanged > 0) {
       const penalizedCommentDensity = Math.max(
         0,
@@ -353,6 +479,23 @@ export function aggregateDeveloperMetrics(
         weight: QUALITY_WEIGHTS.lowCommentDensity,
         score: lowCommentDensityScore,
       });
+
+      lowUnresolvedCommentsScore = normalizeInverse(
+        unresolvedReviewCommentsPer100Lines,
+        SCORE_SCALE.unresolvedCommentDensity,
+      );
+      components.push({
+        key: 'lowUnresolvedComments',
+        weight: QUALITY_WEIGHTS.lowUnresolvedComments,
+        score: lowUnresolvedCommentsScore,
+      });
+
+      testChangeCoverageScore = clamp01(testChangeRatio / SCORE_SCALE.testChangeRatioTarget);
+      components.push({
+        key: 'testChangeCoverage',
+        weight: QUALITY_WEIGHTS.testChangeCoverage,
+        score: testChangeCoverageScore,
+      });
     }
 
     const appliedWeight = components.reduce((s, c) => s + c.weight, 0);
@@ -360,6 +503,29 @@ export function aggregateDeveloperMetrics(
     const qualityScore = appliedWeight > 0 ? 100 * (weightedScore / appliedWeight) : 0;
     const scoreCoverageRate = TOTAL_WEIGHT > 0 ? appliedWeight / TOTAL_WEIGHT : 0;
     const { confidenceScore, confidenceLevel } = calculateConfidence(totalMRs, scoreCoverageRate);
+    const workloadScore = calculateWorkloadScore(
+      totalMRs,
+      effectiveWorkloadLinesChanged,
+      maxMRs,
+      maxEffectiveWorkloadLinesChanged,
+    );
+    const platformReadinessScore = calculatePlatformReadinessScore(qualityScore, workloadScore);
+    const dataWarnings = [
+      ...(totalLinesChanged > 0 && testChangeRatio === 0 ? ['테스트 변경 라인이 없음'] : []),
+      ...(oversizedMRRatio >= 0.2
+        ? [`대형 MR 비율이 ${(oversizedMRRatio * 100).toFixed(1)}%로 높음`]
+        : []),
+      ...(unresolvedReviewCommentsPer100Lines >= 0.25
+        ? [
+            `100줄당 미해결 코멘트가 ${unresolvedReviewCommentsPer100Lines.toFixed(
+              2,
+            )}개로 높음`,
+          ]
+        : []),
+      ...(initLikeMRs > 0
+        ? [`초기 구축성 MR ${initLikeMRs}개의 라인 기여도 축소`]
+        : []),
+    ];
 
     result.push({
       username,
@@ -370,6 +536,9 @@ export function aggregateDeveloperMetrics(
       mergeRate,
       totalLinesChanged,
       avgLinesChangedPerMR,
+      effectiveWorkloadLinesChanged: round1(effectiveWorkloadLinesChanged),
+      initLikeMRs,
+      initLikeLinesChanged,
       totalReviewComments,
       avgReviewCommentsPerMR,
       reviewCommentsPer100Lines,
@@ -384,28 +553,42 @@ export function aggregateDeveloperMetrics(
       reReviewedThreadRatio,
       pipelineEvaluatedMRs,
       pipelineMissingMRs,
+      pipelineCoverageRate,
       pipelineFirstTrySuccessRate,
       totalCommits,
       revertCommits,
       revertCommitRatio,
       oversizedMRs,
       oversizedMRRatio,
+      totalTestLinesChanged,
+      testChangeRatio,
       avgHoursToMerge,
       scoreBreakdown: {
         lowReReview: lowReReviewScore === null ? null : scoreTo100(lowReReviewScore),
         pipelineFirstTry: pipelineFirstTryScore === null ? null : scoreTo100(pipelineFirstTryScore),
         lowCommentDensity:
           lowCommentDensityScore === null ? null : scoreTo100(lowCommentDensityScore),
+        lowUnresolvedComments:
+          lowUnresolvedCommentsScore === null ? null : scoreTo100(lowUnresolvedCommentsScore),
         lowRevertRatio: scoreTo100(lowRevertRatioScore),
+        lowOversizedMRRatio: scoreTo100(lowOversizedMRRatioScore),
+        testChangeCoverage:
+          testChangeCoverageScore === null ? null : scoreTo100(testChangeCoverageScore),
       },
       scoreCoverageRate: round1(scoreCoverageRate * 100),
       confidenceScore,
       confidenceLevel,
+      workloadScore,
+      platformReadinessScore,
+      dataWarnings,
       qualityScore: round1(qualityScore),
     });
   }
 
   return result.sort((a, b) => {
+    if (b.platformReadinessScore !== a.platformReadinessScore) {
+      return b.platformReadinessScore - a.platformReadinessScore;
+    }
     if (b.qualityScore !== a.qualityScore) return b.qualityScore - a.qualityScore;
     return b.confidenceScore - a.confidenceScore;
   });
