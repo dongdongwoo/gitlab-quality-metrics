@@ -1,0 +1,22 @@
+{
+  "name": "gitlab-quality-metrics",
+  "version": "1.0.0",
+  "description": "GitLab MR 데이터를 기반으로 개발자별 코드 퀄리티 지표를 추출하는 CLI",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
